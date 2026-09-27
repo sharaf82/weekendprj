@@ -281,6 +281,21 @@ def send_message(api_key, model, messages):
 		return None
 
 
+def load_agent_memory():
+	memory_path = WORKSPACE / "AGENTS.md"
+	try:
+		content = memory_path.read_text(encoding="utf-8")
+	except OSError as error:
+		print(f"Could not load {memory_path.name}: {error}", file=sys.stderr)
+		return None
+	if not content.strip():
+		return None
+	return {
+		"role": "system",
+		"content": f"Repository memory from {memory_path.name}:\n\n{content}",
+	}
+
+
 def main():
 	parser = argparse.ArgumentParser(description="Chat with a model through OpenRouter.")
 	parser.add_argument("prompt", nargs="*", help="Optional first message")
@@ -294,7 +309,8 @@ def main():
 	if not model:
 		parser.error("OPENROUTER_MODEL was not found in the environment or .env file")
 
-	messages = []
+	agent_memory = load_agent_memory()
+	messages = [agent_memory] if agent_memory else []
 	first_message = " ".join(args.prompt) if args.prompt else None
 	print("Chat with OpenRouter. Type 'exit' or 'quit' to end.")
 	while True:
