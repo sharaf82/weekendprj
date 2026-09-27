@@ -14,6 +14,7 @@ WORKSPACE = Path(__file__).resolve().parent
 MAX_FILE_BYTES = 100_000
 MAX_COMMAND_OUTPUT = 20_000
 COMMAND_TIMEOUT_SECONDS = 30
+APPROVE_ALL_COMMANDS = False
 
 TOOLS = [
 	{
@@ -182,16 +183,22 @@ def delete_file(path):
 
 
 def execute_bash(command):
+	global APPROVE_ALL_COMMANDS
 	if not isinstance(command, str) or not command.strip():
 		raise ValueError("The command must be a non-empty string.")
 
 	print(f"\nRequested Bash command (working directory: {WORKSPACE}):\n{command}")
-	try:
-		approval = input("Run this command? [y/N] ").strip().lower()
-	except (EOFError, KeyboardInterrupt):
-		return json.dumps({"approved": False, "message": "Command cancelled."})
-	if approval != "y":
-		return json.dumps({"approved": False, "message": "Command not run."})
+	if not APPROVE_ALL_COMMANDS:
+		try:
+			approval = input("Run this command? [y/N/all for this task] ").strip().lower()
+		except (EOFError, KeyboardInterrupt):
+			return json.dumps({"approved": False, "message": "Command cancelled."})
+		if approval == "all":
+			APPROVE_ALL_COMMANDS = True
+		elif approval != "y":
+			return json.dumps({"approved": False, "message": "Command not run."})
+	else:
+		print("Automatically approved for this task.")
 
 	try:
 		result = subprocess.run(
@@ -251,34 +258,92 @@ def run_tool(tool_call):
 
 
 def send_message(api_key, model, messages):
+	content = []
+	tool_calls = {}
+	stream_started = False
 	try:
-		response = requests.post(
+		with requests.post(
 			API_URL,
 			headers={
 				"Authorization": f"Bearer {api_key}",
 				"Content-Type": "application/json",
 			},
-			json={"model": model, "messages": messages, "tools": TOOLS, "tool_choice": "auto"},
+			json={
+				"model": model,
+				"messages": messages,
+				"tools": TOOLS,
+				"tool_choice": "auto",
+				"stream": True,
+			},
 			timeout=60,
-		)
+			stream=True,
+		) as response:
+			if not response.ok:
+				try:
+					error = response.json().get("error", {})
+					detail = error.get("message") if isinstance(error, dict) else str(error)
+				except ValueError:
+					detail = response.reason
+				print(f"OpenRouter request failed (HTTP {response.status_code}): {detail}", file=sys.stderr)
+				return None
+
+			for line in response.iter_lines(chunk_size=1, decode_unicode=True):
+				if not line:
+					continue
+				if isinstance(line, bytes):
+					line = line.decode("utf-8")
+				if not line.startswith("data:"):
+					continue
+				data = line[5:].strip()
+				if data == "[DONE]":
+					break
+				try:
+					chunk = json.loads(data)
+				except ValueError:
+					continue
+				choices = chunk.get("choices", [])
+				if not choices:
+					continue
+				delta = choices[0].get("delta", {})
+				text = delta.get("content")
+				if isinstance(text, str):
+					if not stream_started:
+						print("OpenRouter: ", end="", flush=True)
+						stream_started = True
+					sys.stdout.write(text)
+					sys.stdout.flush()
+					content.append(text)
+				for call in delta.get("tool_calls", []):
+					index = call.get("index", 0)
+					tool_call = tool_calls.setdefault(index, {
+						"id": "",
+						"type": "function",
+						"function": {"name": "", "arguments": ""},
+					})
+					if call.get("id"):
+						tool_call["id"] = call["id"]
+					if call.get("type"):
+						tool_call["type"] = call["type"]
+					function = call.get("function", {})
+					if function.get("name"):
+						tool_call["function"]["name"] += function["name"]
+					if function.get("arguments"):
+						tool_call["function"]["arguments"] += function["arguments"]
+		if stream_started:
+			print()
 	except requests.RequestException as error:
+		if stream_started:
+			print()
 		print(f"OpenRouter request failed: {error}", file=sys.stderr)
 		return None
 
-	if not response.ok:
-		try:
-			error = response.json().get("error", {})
-			detail = error.get("message") if isinstance(error, dict) else str(error)
-		except ValueError:
-			detail = response.reason
-		print(f"OpenRouter request failed (HTTP {response.status_code}): {detail}", file=sys.stderr)
-		return None
-
-	try:
-		return response.json()["choices"][0]["message"]
-	except (ValueError, KeyError, IndexError, TypeError):
-		print("OpenRouter returned an unexpected response.", file=sys.stderr)
-		return None
+	assistant_message = {
+		"role": "assistant",
+		"content": "".join(content) or None,
+	}
+	if tool_calls:
+		assistant_message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+	return assistant_message
 
 
 def load_agent_memory():
@@ -297,6 +362,7 @@ def load_agent_memory():
 
 
 def main():
+	global APPROVE_ALL_COMMANDS
 	parser = argparse.ArgumentParser(description="Chat with a model through OpenRouter.")
 	parser.add_argument("prompt", nargs="*", help="Optional first message")
 	args = parser.parse_args()
@@ -330,6 +396,7 @@ def main():
 		if message.lower() in {"exit", "quit"}:
 			break
 
+		APPROVE_ALL_COMMANDS = False
 		request_messages = messages + [{"role": "user", "content": message}]
 		for _ in range(8):
 			assistant_message = send_message(api_key, model, request_messages)
@@ -338,10 +405,8 @@ def main():
 			request_messages.append(assistant_message)
 			tool_calls = assistant_message.get("tool_calls") or []
 			if not tool_calls:
-				answer = assistant_message.get("content")
-				if answer:
+				if assistant_message.get("content"):
 					messages = request_messages
-					print(f"OpenRouter: {answer}")
 				else:
 					print("OpenRouter returned an empty response.", file=sys.stderr)
 				break
